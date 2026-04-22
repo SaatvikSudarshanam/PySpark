@@ -42,8 +42,17 @@ Other options:
 - Set `GROQ_API_KEY` in your shell
 - Put it in `.streamlit/secrets.toml` as `GROQ_API_KEY="your_key"`
 
+## GitHub import
+
+The app can also load a `.item` file from GitHub using a GitHub blob URL or a raw GitHub URL.
+
+Example:
+
+```text
+https://github.com/<owner>/<repo>/blob/<branch>/path/to/file.item
+```
+
 ## Notes
 
 - The app will try the FastAPI backend first and fall back to local conversion if the backend is not running.
 - XML preview and PySpark preview each have download buttons.
-

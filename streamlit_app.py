@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import requests
@@ -31,6 +32,32 @@ def _as_result_dict(result):
     }
 
 
+def _normalize_github_raw_url(url: str) -> str:
+    cleaned = url.strip()
+
+    blob_match = re.match(
+        r"^https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)$",
+        cleaned,
+    )
+    if blob_match:
+        owner, repo, branch, path = blob_match.groups()
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+
+    if cleaned.startswith("https://github.com/"):
+        return cleaned.replace("https://github.com/", "https://raw.githubusercontent.com/", 1)
+    if cleaned.startswith("http://github.com/"):
+        return cleaned.replace("http://github.com/", "https://raw.githubusercontent.com/", 1)
+    return cleaned
+
+
+def _fetch_github_item(url: str) -> tuple[str, str]:
+    raw_url = _normalize_github_raw_url(url)
+    response = requests.get(raw_url, timeout=120)
+    response.raise_for_status()
+    filename = Path(raw_url).name or "github-item.item"
+    return filename, response.text
+
+
 def _convert_via_backend(uploaded_file, backend_url: str, groq_api_key: str, model: str):
     endpoint = backend_url.strip()
     if not endpoint:
@@ -56,6 +83,16 @@ def _convert_via_backend(uploaded_file, backend_url: str, groq_api_key: str, mod
     return response.json()
 
 
+class _MemoryUpload:
+    def __init__(self, name: str, text: str):
+        self.name = name
+        self._text = text
+        self.type = "application/xml"
+
+    def getvalue(self):
+        return self._text.encode("utf-8")
+
+
 st.markdown(
     """
     <style>
@@ -79,6 +116,8 @@ st.markdown(
 
 
 st.title("Talend .item to XML + PySpark")
+st.caption("Upload a local file or import one from GitHub, then preview XML and generated PySpark.")
+
 with st.sidebar:
     st.header("Groq settings")
     backend_url = st.text_input(
@@ -98,13 +137,47 @@ with st.sidebar:
         help="You can change this if you want a different Groq-supported model.",
     )
     
-   
 
-uploaded = st.file_uploader("Upload a `.item` file", type=["item", "xml"])
+st.subheader("Input source")
+source_mode = st.radio("Choose how to load the `.item` file", ["Local file", "GitHub URL"], horizontal=True)
+
+uploaded = None
+github_loaded = st.session_state.get("github_loaded")
+if source_mode == "Local file":
+    uploaded = st.file_uploader("Upload a `.item` file", type=["item", "xml"])
+    if uploaded is not None:
+        st.session_state.pop("github_loaded", None)
+        github_loaded = None
+else:
+    github_url = st.text_input(
+        "GitHub file URL",
+        placeholder="https://github.com/<owner>/<repo>/blob/<branch>/path/to/file.item",
+        help="Paste a GitHub blob URL or raw.githubusercontent.com URL for a .item file.",
+    )
+    load_github = st.button("Load from GitHub", use_container_width=True, disabled=not github_url.strip())
+    if load_github and github_url.strip():
+        try:
+            github_source_name, github_source_text = _fetch_github_item(github_url)
+            github_loaded = {
+                "source_name": github_source_name,
+                "source_text": github_source_text,
+                "source_url": github_url.strip(),
+            }
+            st.session_state["github_loaded"] = github_loaded
+            st.success(f"Loaded {github_source_name} from GitHub.")
+        except Exception as exc:
+            st.error(f"Could not load the GitHub file: {exc}")
+
+    if github_loaded:
+        st.info(f"Loaded from GitHub: {github_loaded['source_name']}")
 
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    convert_pressed = st.button("Convert", use_container_width=True, disabled=uploaded is None)
+    convert_pressed = st.button(
+        "Convert",
+        use_container_width=True,
+        disabled=(uploaded is None and github_loaded is None),
+    )
 with col_b:
     reset_pressed = st.button("Reset", use_container_width=True)
 with col_c:
@@ -117,22 +190,28 @@ with col_c:
 
 if reset_pressed:
     st.session_state.pop("conversion_result", None)
+    st.session_state.pop("github_loaded", None)
     st.rerun()
 
-if uploaded and (convert_pressed or "conversion_result" not in st.session_state):
+if (uploaded or github_loaded) and (convert_pressed or "conversion_result" not in st.session_state):
     backend_result = None
     try:
-        backend_result = _convert_via_backend(uploaded, backend_url, groq_api_key, model)
+        if uploaded:
+            backend_result = _convert_via_backend(uploaded, backend_url, groq_api_key, model)
+        else:
+            memory_upload = _MemoryUpload(github_loaded["source_name"], github_loaded["source_text"])
+            backend_result = _convert_via_backend(memory_upload, backend_url, groq_api_key, model)
     except Exception as exc:
         st.warning(f"FastAPI endpoint was not reachable, so Streamlit will convert locally instead. {exc}")
 
     if backend_result:
         st.session_state["conversion_result"] = backend_result
     else:
-        raw_text = uploaded.getvalue().decode("utf-8", errors="ignore")
+        raw_text = uploaded.getvalue().decode("utf-8", errors="ignore") if uploaded else github_loaded["source_text"]
+        source_name = uploaded.name if uploaded else github_loaded["source_name"]
         local = convert_item_text(
             raw_text=raw_text,
-            source_name=uploaded.name,
+            source_name=source_name,
             groq_api_key=groq_api_key.strip() or None,
             model=model.strip() or "openai/gpt-oss-20b",
         )
@@ -166,5 +245,5 @@ if result:
             use_container_width=True,
         )
 else:
-    st.info("Upload a Talend `.item` file to see the XML and PySpark previews.")
+    st.info("Upload a Talend `.item` file or load one from GitHub to see the XML and PySpark previews.")
 
