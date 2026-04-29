@@ -28,6 +28,8 @@ async def convert(
     file: UploadFile = File(...),
     groq_api_key: str | None = Form(default=None),
     model: str = Form(default=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")),
+    properties_text: str | None = Form(default=None),
+    properties_name: str | None = Form(default=None),
 ):
     try:
         raw_bytes = await file.read()
@@ -35,11 +37,14 @@ async def convert(
         result = convert_item_text(
             raw_text=raw_text,
             source_name=file.filename or "uploaded.item",
+            properties_text=properties_text,
+            properties_name=properties_name,
             groq_api_key=groq_api_key or os.getenv("GROQ_API_KEY"),
             model=model,
         )
         return {
             "source_name": result.source_name,
+            "properties_name": result.properties_name,
             "xml_preview": result.xml_preview,
             "pyspark_preview": result.pyspark_preview,
             "xml_is_valid": result.xml_is_valid,
@@ -47,4 +52,3 @@ async def convert(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
