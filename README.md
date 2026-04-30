@@ -82,9 +82,11 @@ The app can also load a `.item` file from a GitHub profile by choosing:
 
 - Repository name
 - Branch name
-- Job name
+- Job checkboxes
 
-Paste the GitHub profile link first, then pick a project name, then pick a branch, then pick the `.item` job from the dropdown.
+Paste the GitHub profile link first, then pick a project name, then pick a branch, then check one or more `.item` jobs to convert.
+Select multiple jobs with the checkbox grid, then convert them together and switch previews with the pill bar below.
+Use `Select all` and `Clear all` to manage long branches quickly.
 
 Example:
 
@@ -93,6 +95,9 @@ https://github.com/<username>
 ```
 
 If a matching `.properties` file exists next to the `.item`, the app loads it automatically and passes its values into the converter.
+
+Databricks pushes overwrite the notebook you select in the workspace browser.
+When you convert multiple GitHub jobs, the Databricks push writes them into one notebook source with one cell per job.
 
 ## Notes
 

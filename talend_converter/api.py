@@ -30,6 +30,7 @@ async def convert(
     model: str = Form(default=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")),
     properties_text: str | None = Form(default=None),
     properties_name: str | None = Form(default=None),
+    volume_prefix: str | None = Form(default=os.getenv("DATABRICKS_VOLUME_PREFIX", "/Volumes/shared/talend-conversion")),
 ):
     try:
         raw_bytes = await file.read()
@@ -40,6 +41,7 @@ async def convert(
             properties_text=properties_text,
             properties_name=properties_name,
             groq_api_key=groq_api_key or os.getenv("GROQ_API_KEY"),
+            volume_prefix=volume_prefix,
             model=model,
         )
         return {

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -64,6 +66,73 @@ def _get_secret(name: str, default: str = "") -> str:
         return str(st.secrets.get(name, default)).strip()
     except Exception:
         return default
+
+
+def _vault_path() -> Path:
+    return Path.home() / ".talend_converter_vault.json"
+
+
+def _load_vault() -> dict[str, str]:
+    path = _vault_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(value) for key, value in payload.items() if value is not None}
+
+
+def _save_vault(values: dict[str, str]) -> None:
+    path = _vault_path()
+    path.write_text(json.dumps(values, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _clear_vault() -> None:
+    path = _vault_path()
+    if path.exists():
+        path.unlink()
+
+
+def _seed_session_defaults() -> None:
+    defaults = {
+        "backend_url": os.getenv("BACKEND_URL", "http://localhost:8000/convert"),
+        "groq_api_key": os.getenv("GROQ_API_KEY", ""),
+        "model": os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+        "github_token": os.getenv("GITHUB_TOKEN", _get_secret("GITHUB_TOKEN", "")),
+        "databricks_workspace_url": os.getenv("DATABRICKS_WORKSPACE_URL", ""),
+        "databricks_token": os.getenv("DATABRICKS_TOKEN", _get_secret("DATABRICKS_TOKEN", "")),
+        "databricks_target_path": os.getenv("DATABRICKS_TARGET_PATH", "/Shared/talend-conversion"),
+        "databricks_root_path": os.getenv("DATABRICKS_ROOT_PATH", "/Users"),
+        "databricks_volume_prefix": os.getenv("DATABRICKS_VOLUME_PREFIX", "/Volumes/shared/talend-conversion"),
+        "github_profile_url": "",
+        "vault_name": "personal",
+    }
+    defaults.update(_load_vault())
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def _capture_vault_values() -> dict[str, str]:
+    return {
+        "backend_url": st.session_state.get("backend_url", "").strip(),
+        "groq_api_key": st.session_state.get("groq_api_key", "").strip(),
+        "model": st.session_state.get("model", "").strip(),
+        "github_token": st.session_state.get("github_token", "").strip(),
+        "databricks_workspace_url": st.session_state.get("databricks_workspace_url", "").strip(),
+        "databricks_token": st.session_state.get("databricks_token", "").strip(),
+        "databricks_target_path": st.session_state.get("databricks_target_path", "").strip(),
+        "databricks_root_path": st.session_state.get("databricks_root_path", "").strip(),
+        "databricks_volume_prefix": st.session_state.get("databricks_volume_prefix", "").strip(),
+        "github_profile_url": st.session_state.get("github_profile_url", "").strip(),
+    }
+
+
+def _apply_vault_values(values: dict[str, str]) -> None:
+    for key, value in values.items():
+        st.session_state[key] = value
 
 
 def _parse_github_profile_url(url: str) -> str | None:
@@ -198,6 +267,10 @@ def _match_properties_path(item_path: str, paths: list[str]) -> str | None:
     return None
 
 
+def _job_checkbox_key(username: str, repo: str, branch: str, idx: int) -> str:
+    return f"github_job_{username}_{repo}_{branch}_{idx}"
+
+
 def _split_local_uploads(files) -> tuple[tuple[str, str] | None, tuple[str, str] | None]:
     item_file = None
     prop_file = None
@@ -218,6 +291,7 @@ def _convert_via_backend(
     model: str,
     properties_text: str | None = None,
     properties_name: str | None = None,
+    volume_prefix: str | None = None,
 ):
     endpoint = backend_url.strip()
     if not endpoint:
@@ -242,9 +316,45 @@ def _convert_via_backend(
         data["properties_text"] = properties_text
     if properties_name:
         data["properties_name"] = properties_name
+    if volume_prefix:
+        data["volume_prefix"] = volume_prefix
     response = requests.post(endpoint, files=files, data=data, timeout=120)
     response.raise_for_status()
     return response.json()
+
+
+def _convert_source_text(
+    source_name: str,
+    raw_text: str,
+    backend_url: str,
+    groq_api_key: str,
+    model: str,
+    properties_text: str | None = None,
+    properties_name: str | None = None,
+    volume_prefix: str | None = None,
+):
+    memory_upload = _MemoryUpload(source_name, raw_text)
+    try:
+        return _convert_via_backend(
+            memory_upload,
+            backend_url,
+            groq_api_key,
+            model,
+            properties_text=properties_text,
+            properties_name=properties_name,
+            volume_prefix=volume_prefix,
+        )
+    except Exception:
+        local = convert_item_text(
+            raw_text=raw_text,
+            source_name=source_name,
+            properties_text=properties_text,
+            properties_name=properties_name,
+            groq_api_key=groq_api_key.strip() or None,
+            volume_prefix=volume_prefix,
+            model=model.strip() or "openai/gpt-oss-20b",
+        )
+        return _as_result_dict(local)
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -373,6 +483,37 @@ def _resolve_databricks_target_path(base_path: str, source_name: str, extension:
     return cleaned
 
 
+def _unique_databricks_target_path(base_path: str, source_name: str, extension: str, job_name: str | None = None) -> str:
+    cleaned = base_path.strip().rstrip("/")
+    stem_source = job_name or source_name
+    stem = Path(stem_source).stem or "talend-conversion"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{stem}_{timestamp}{extension}"
+
+    if not cleaned:
+        return f"/Shared/{filename}"
+    if cleaned.endswith(extension):
+        folder = str(Path(cleaned).parent).replace("\\", "/")
+        return f"{folder.rstrip('/')}/{filename}"
+    if "/" not in Path(cleaned).name and "." not in Path(cleaned).name:
+        return f"{cleaned}/{filename}"
+    if cleaned.endswith("/"):
+        return f"{cleaned}{filename}"
+    folder = str(Path(cleaned).parent).replace("\\", "/")
+    return f"{folder.rstrip('/')}/{filename}"
+
+
+def _converted_databricks_target_path(folder_path: str, extension: str, existing_paths: list[str] | None = None) -> str:
+    cleaned = folder_path.strip().rstrip("/")
+    candidate = f"{cleaned}/converted{extension}" if cleaned else f"/Shared/converted{extension}"
+    normalized_existing = {path.rstrip("/") for path in (existing_paths or [])}
+    if candidate not in normalized_existing:
+        return candidate
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{cleaned or '/Shared'}/converted_{timestamp}{extension}"
+
+
 def _build_databricks_payload(result: dict, export_mode: str) -> tuple[str, str, str | None, str]:
     if export_mode == "Markdown file (.md)":
         content_lines = [
@@ -400,6 +541,47 @@ def _build_databricks_payload(result: dict, export_mode: str) -> tuple[str, str,
         result["pyspark_preview"].rstrip(),
         "",
     ]
+    return "\n".join(notebook_lines), "SOURCE", "PYTHON", ".py"
+
+
+def _build_databricks_batch_payload(results: list[dict], export_mode: str) -> tuple[str, str, str | None, str]:
+    if not results:
+        raise ValueError("No converted jobs available to push.")
+
+    if export_mode == "Markdown file (.md)":
+        sections = []
+        for item in results:
+            sections.extend(
+                [
+                    f"# Talend conversion for {item['source_name']}",
+                    "",
+                    "## XML Preview",
+                    "```xml",
+                    item["xml_preview"],
+                    "```",
+                    "",
+                    "## PySpark Preview",
+                    "```python",
+                    item["pyspark_preview"],
+                    "```",
+                    "",
+                    "## Notes",
+                ]
+            )
+            sections.extend(f"- {note}" for note in item["notes"])
+            sections.append("")
+        return "\n".join(sections).rstrip() + "\n", "RAW", None, ".md"
+
+    notebook_lines = ["# Databricks notebook source"]
+    for idx, item in enumerate(results):
+        notebook_lines.extend(
+            [
+                "# COMMAND ----------",
+                f"# Job: {item.get('job', item['source_name'])}",
+                item["pyspark_preview"].rstrip(),
+                "",
+            ]
+        )
     return "\n".join(notebook_lines), "SOURCE", "PYTHON", ".py"
 
 
@@ -466,28 +648,53 @@ st.markdown(
 st.title("Talend .item to XML + PySpark")
 st.caption("Upload a local file or import one from GitHub, then preview XML and generated PySpark.")
 
+_seed_session_defaults()
+
 with st.sidebar:
+    st.header("Vault")
+    st.caption("Saved locally on this machine only. Use Save once, then the fields will auto-fill next time.")
+    vault_name = st.text_input("Vault name", key="vault_name")
+    vault_action_left, vault_action_right, vault_action_clear = st.columns(3)
+    with vault_action_left:
+        save_vault = st.button("Save", use_container_width=True)
+    with vault_action_right:
+        load_vault = st.button("Load", use_container_width=True)
+    with vault_action_clear:
+        clear_vault = st.button("Clear", use_container_width=True)
+
+    if save_vault:
+        _save_vault(_capture_vault_values())
+        st.success(f"Saved vault '{vault_name or 'personal'}'.")
+    if load_vault:
+        _apply_vault_values(_load_vault())
+        st.rerun()
+    if clear_vault:
+        _clear_vault()
+        st.success("Vault cleared.")
+        st.rerun()
+
+    st.divider()
     st.header("Groq settings")
     backend_url = st.text_input(
         "FastAPI convert endpoint",
-        value=os.getenv("BACKEND_URL", "http://localhost:8000/convert"),
+        key="backend_url",
         help="The app will try this FastAPI endpoint first, then fall back to local conversion if it cannot reach it.",
     )
     groq_api_key = st.text_input(
         "Paste your Groq API key here",
         type="password",
-        value=os.getenv("GROQ_API_KEY", ""),
+        key="groq_api_key",
         help="For local testing, paste the key here. For deployment, use the GROQ_API_KEY environment variable or Streamlit secrets.",
     )
     model = st.text_input(
         "Groq model",
-        value=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+        key="model",
         help="You can change this if you want a different Groq-supported model.",
     )
     github_token = st.text_input(
         "GitHub token",
         type="password",
-        value=os.getenv("GITHUB_TOKEN", _get_secret("GITHUB_TOKEN", "")),
+        key="github_token",
         help="Optional. Needed only for private GitHub repos. Keep it in an env var or Streamlit secrets, not in code.",
     )
 
@@ -495,19 +702,19 @@ with st.sidebar:
     st.header("Databricks push")
     databricks_workspace_url = st.text_input(
         "Databricks workspace URL",
-        value=os.getenv("DATABRICKS_WORKSPACE_URL", ""),
+        key="databricks_workspace_url",
         placeholder="https://adb-1234567890123456.7.azuredatabricks.net",
         help="Paste the workspace base URL. The app will push the current output directly into Databricks.",
     )
     databricks_token = st.text_input(
         "Databricks token",
         type="password",
-        value=os.getenv("DATABRICKS_TOKEN", _get_secret("DATABRICKS_TOKEN", "")),
+        key="databricks_token",
         help="Personal access token used to import the notebook or file into your workspace.",
     )
     databricks_target_path = st.text_input(
         "Databricks target path",
-        value=os.getenv("DATABRICKS_TARGET_PATH", "/Shared/talend-conversion"),
+        key="databricks_target_path",
         help="Enter a folder or a full file path. If you enter a folder, the app will add a file name automatically.",
     )
     databricks_export_mode = st.selectbox(
@@ -518,8 +725,13 @@ with st.sidebar:
     databricks_overwrite = st.checkbox("Overwrite existing path", value=True)
     databricks_root_path = st.text_input(
         "Databricks workspace root",
-        value=os.getenv("DATABRICKS_ROOT_PATH", "/Users"),
+        key="databricks_root_path",
         help="Use a workspace path like /Users or /Workspace/Users. The app will browse from there.",
+    )
+    databricks_volume_prefix = st.text_input(
+        "Databricks volume prefix",
+        key="databricks_volume_prefix",
+        help="Use the exact Unity Catalog volume prefix, for example /Volumes/main/default/my_volume. The app will rewrite file paths to this prefix.",
     )
     load_databricks = st.button("Load Databricks workspace", use_container_width=True)
     if load_databricks:
@@ -550,7 +762,7 @@ source_mode = st.radio("Choose how to load the `.item` file", ["Local file", "Gi
 
 uploaded = None
 uploaded_properties = None
-github_loaded = st.session_state.get("github_loaded")
+github_batch_results = st.session_state.get("github_batch_results")
 if source_mode == "Local file":
     uploaded_files = st.file_uploader(
         "Upload `.item` and optional `.properties` files",
@@ -559,19 +771,18 @@ if source_mode == "Local file":
     )
     uploaded, uploaded_properties = _split_local_uploads(uploaded_files)
     if uploaded is not None:
-        st.session_state.pop("github_loaded", None)
-        github_loaded = None
+        st.session_state.pop("github_batch_results", None)
+        st.session_state.pop("active_batch_preview", None)
 else:
     github_profile_url = st.text_input(
         "GitHub profile link",
         placeholder="https://github.com/<username>",
+        key="github_profile_url",
         help="Paste your GitHub profile link. The app will show repo, branch, and job dropdowns next.",
     )
     github_username = _parse_github_profile_url(github_profile_url) if github_profile_url.strip() else None
     selected_repo = None
     selected_branch = None
-    selected_job = None
-
     if github_username:
         st.markdown(f"**GitHub Profile:** `{github_username}`")
         try:
@@ -597,43 +808,118 @@ else:
                     jobs = []
 
                 if jobs:
-                    selected_job = st.selectbox("Job Name", jobs, index=0)
-                    load_github = st.button("Load selected job", use_container_width=True)
-                    if load_github:
+                    st.markdown("**Select jobs to convert**")
+                    action_left, action_right, action_spacer = st.columns([1, 1, 2])
+                    job_keys = [
+                        _job_checkbox_key(github_username, selected_repo, selected_branch, idx)
+                        for idx in range(len(jobs))
+                    ]
+                    with action_left:
+                        select_all = st.button("Select all", use_container_width=True)
+                    with action_right:
+                        clear_all = st.button("Clear all", use_container_width=True)
+                    if select_all:
+                        for key in job_keys:
+                            st.session_state[key] = True
+                        st.rerun()
+                    if clear_all:
+                        for key in job_keys:
+                            st.session_state[key] = False
+                        st.rerun()
+
+                    selected_jobs: list[str] = []
+                    job_columns = st.columns(3)
+                    for idx, job in enumerate(jobs):
+                        column = job_columns[idx % 3]
+                        checkbox_label = Path(job).name or job
+                        with column:
+                            if st.checkbox(checkbox_label, key=job_keys[idx]):
+                                st.caption(job)
+                                selected_jobs.append(job)
+                            else:
+                                st.caption(job)
+                    st.caption(f"{len(selected_jobs)} of {len(jobs)} jobs selected")
+
+                    convert_selected_jobs = st.button(
+                        "Convert selected jobs",
+                        use_container_width=True,
+                        disabled=not selected_jobs,
+                    )
+                    if convert_selected_jobs:
+                        batch_results = []
+                        branch_tree = []
                         try:
-                            github_source_name, github_source_text = _fetch_github_item(
-                                f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
-                                github_token=github_token,
+                            branch_tree = _fetch_github_branch_tree(
+                                github_username,
+                                selected_repo,
+                                selected_branch,
+                                github_token or None,
                             )
-                            github_properties_name = None
-                            github_properties_text = None
+                        except Exception:
+                            branch_tree = []
+
+                        progress = st.progress(0, text="Converting selected jobs...")
+                        for idx, selected_job in enumerate(selected_jobs, start=1):
                             try:
-                                branch_tree = _fetch_github_branch_tree(github_username, selected_repo, selected_branch, github_token or None)
-                                matched_properties = _match_properties_path(selected_job, branch_tree)
-                                if matched_properties:
-                                    github_properties_name, github_properties_text = _fetch_github_item(
-                                        f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{matched_properties}",
-                                        github_token=github_token,
-                                    )
-                            except Exception:
+                                github_source_name, github_source_text = _fetch_github_item(
+                                    f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
+                                    github_token=github_token,
+                                )
                                 github_properties_name = None
                                 github_properties_text = None
-                            github_loaded = {
-                                "source_name": github_source_name,
-                                "source_text": github_source_text,
-                                "properties_name": github_properties_name,
-                                "properties_text": github_properties_text,
-                                "source_url": f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
-                                "repo": selected_repo,
-                                "branch": selected_branch,
-                                "job": selected_job,
-                            }
-                            st.session_state["github_loaded"] = github_loaded
-                            st.success(f"Loaded {github_source_name} from GitHub.")
-                            if github_properties_name:
-                                st.info(f"Matched properties file: {github_properties_name}")
-                        except Exception as exc:
-                            st.error(f"Could not load the selected job: {exc}")
+                                try:
+                                    matched_properties = _match_properties_path(selected_job, branch_tree)
+                                    if matched_properties:
+                                        github_properties_name, github_properties_text = _fetch_github_item(
+                                            f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{matched_properties}",
+                                            github_token=github_token,
+                                        )
+                                except Exception:
+                                    github_properties_name = None
+                                    github_properties_text = None
+
+                                converted = _convert_source_text(
+                                    github_source_name,
+                                    github_source_text,
+                                    backend_url,
+                                    groq_api_key,
+                                    model,
+                                    properties_text=github_properties_text,
+                                    properties_name=github_properties_name,
+                                    volume_prefix=databricks_volume_prefix,
+                                )
+                                converted.update(
+                                    {
+                                        "repo": selected_repo,
+                                        "branch": selected_branch,
+                                        "job": selected_job,
+                                        "source_url": f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
+                                        "preview_label": f"{selected_job}",
+                                    }
+                                )
+                                batch_results.append(converted)
+                            except Exception as exc:
+                                batch_results.append(
+                                    {
+                                        "source_name": selected_job,
+                                        "properties_name": None,
+                                        "xml_preview": "",
+                                        "pyspark_preview": "",
+                                        "xml_is_valid": False,
+                                        "notes": [f"Conversion failed for {selected_job}: {exc}"],
+                                        "repo": selected_repo,
+                                        "branch": selected_branch,
+                                        "job": selected_job,
+                                        "source_url": f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
+                                        "preview_label": f"{selected_job}",
+                                    }
+                                )
+                            progress.progress(idx / len(selected_jobs), text=f"Converted {idx} of {len(selected_jobs)} jobs")
+
+                        st.session_state["github_batch_results"] = batch_results
+                        st.session_state["active_batch_preview"] = batch_results[0]["preview_label"] if batch_results else None
+                        st.session_state.pop("conversion_result", None)
+                        st.success(f"Converted {len(batch_results)} selected jobs.")
                 else:
                     st.info("No `.item` files were found on this branch.")
             else:
@@ -641,19 +927,12 @@ else:
         else:
             st.info("Enter your GitHub profile link to see repositories.")
 
-    if github_loaded:
-        st.info(
-            f"Loaded from GitHub: {github_loaded['repo']} | {github_loaded['branch']} | {github_loaded['job']}"
-        )
-        if github_loaded.get("properties_name"):
-            st.caption(f"Matched properties: {github_loaded['properties_name']}")
-
 col_a, col_b, col_c = st.columns(3)
 with col_a:
     convert_pressed = st.button(
         "Convert",
         use_container_width=True,
-        disabled=(uploaded is None and github_loaded is None),
+        disabled=(source_mode != "Local file" or uploaded is None),
     )
 with col_b:
     reset_pressed = st.button("Reset", use_container_width=True)
@@ -667,80 +946,66 @@ with col_c:
 
 if reset_pressed:
     st.session_state.pop("conversion_result", None)
-    st.session_state.pop("github_loaded", None)
+    st.session_state.pop("github_batch_results", None)
+    st.session_state.pop("active_batch_preview", None)
     st.session_state.pop("databricks_tree", None)
     st.rerun()
 
-if (uploaded or github_loaded) and (convert_pressed or "conversion_result" not in st.session_state):
-    backend_result = None
-    active_properties_name = uploaded_properties[0] if uploaded_properties else github_loaded.get("properties_name") if github_loaded else None
-    active_properties_text = uploaded_properties[1] if uploaded_properties else github_loaded.get("properties_text") if github_loaded else None
+if source_mode == "Local file" and uploaded and (convert_pressed or "conversion_result" not in st.session_state):
+    active_properties_name = uploaded_properties[0] if uploaded_properties else None
+    active_properties_text = uploaded_properties[1] if uploaded_properties else None
+    source_name, raw_text = uploaded
     try:
-        if uploaded:
-            backend_result = _convert_via_backend(
-                uploaded,
-                backend_url,
-                groq_api_key,
-                model,
-                properties_text=active_properties_text,
-                properties_name=active_properties_name,
-            )
-        else:
-            memory_upload = _MemoryUpload(github_loaded["source_name"], github_loaded["source_text"])
-            backend_result = _convert_via_backend(
-                memory_upload,
-                backend_url,
-                groq_api_key,
-                model,
-                properties_text=active_properties_text,
-                properties_name=active_properties_name,
-            )
-    except Exception as exc:
-        st.warning(f"FastAPI endpoint was not reachable, so Streamlit will convert locally instead. {exc}")
-
-    if backend_result:
-        st.session_state["conversion_result"] = backend_result
-    else:
-        raw_text = uploaded.getvalue().decode("utf-8", errors="ignore") if uploaded else github_loaded["source_text"]
-        source_name = uploaded.name if uploaded else github_loaded["source_name"]
-        local = convert_item_text(
-            raw_text=raw_text,
+        converted = _convert_source_text(
             source_name=source_name,
+            raw_text=raw_text,
+            backend_url=backend_url,
+            groq_api_key=groq_api_key,
+            model=model,
             properties_text=active_properties_text,
             properties_name=active_properties_name,
-            groq_api_key=groq_api_key.strip() or None,
-            model=model.strip() or "openai/gpt-oss-20b",
+            volume_prefix=databricks_volume_prefix,
         )
-        st.session_state["conversion_result"] = _as_result_dict(local)
+        st.session_state["conversion_result"] = converted
+    except Exception as exc:
+        st.error(f"Could not convert the local upload: {exc}")
 
 result = st.session_state.get("conversion_result")
+batch_results = [] if source_mode == "Local file" else (st.session_state.get("github_batch_results") or [])
 db_tree = st.session_state.get("databricks_tree")
 
-if result:
-    st.subheader(f"Loaded file: {result['source_name']}")
-    st.write(" | ".join(result["notes"]))
+active_result = None
+if batch_results:
+    labels = [item.get("preview_label") or item["source_name"] for item in batch_results]
+    active_label = st.session_state.get("active_batch_preview") or labels[0]
+    if hasattr(st, "segmented_control"):
+        active_label = st.segmented_control("Converted jobs", options=labels, default=active_label)
+    else:
+        active_label = st.radio("Converted jobs", options=labels, index=labels.index(active_label) if active_label in labels else 0, horizontal=True)
+    st.session_state["active_batch_preview"] = active_label
+    active_result = next((item for item in batch_results if (item.get("preview_label") or item["source_name"]) == active_label), batch_results[0])
+elif result:
+    active_result = result
+
+if active_result:
+    if batch_results:
+        st.subheader(f"Converted jobs from: {active_result.get('repo', 'GitHub')} / {active_result.get('branch', 'branch')}")
+    else:
+        st.subheader(f"Loaded file: {active_result['source_name']}")
+    st.write(" | ".join(active_result["notes"]))
 
     st.markdown("### Databricks Push")
     if db_tree:
-        st.caption("Pick a folder and notebook from the loaded workspace tree, then push the current PySpark preview there.")
+        st.caption("Pick a folder and notebook from the loaded workspace tree, then overwrite that notebook with one cell per converted job.")
         db_folder = st.selectbox("Workspace folder", db_tree["folders"], index=0)
         notebook_options = [path for path in db_tree["notebooks"] if path.startswith(db_folder)]
         if not notebook_options:
             notebook_options = db_tree["notebooks"]
         db_notebook = st.selectbox("Notebook file", notebook_options, index=0) if notebook_options else None
-        new_db_notebook_name = st.text_input(
-            "New notebook name",
-            value=f"{Path(result['source_name']).stem}.py",
-            help="Used only if you want to create a new notebook path inside the selected folder.",
-        )
-        push_target_path = db_notebook or f"{db_folder.rstrip('/')}/{new_db_notebook_name.strip() or 'converted.py'}"
+        push_target_path = db_notebook or f"{db_folder.rstrip('/')}/converted.py"
     else:
         st.caption("Enter the Databricks workspace details in the sidebar and load the workspace tree first.")
-        push_target_path = _resolve_databricks_target_path(
-            databricks_target_path,
-            result["source_name"],
-            ".py" if databricks_export_mode == "Python notebook (.py)" else ".md",
-        )
+        push_target_path = databricks_target_path
 
     push_pressed = st.button(
         "Push to Databricks",
@@ -751,15 +1016,17 @@ if result:
 
     if push_pressed:
         try:
-            export_content, export_format, language, extension = _build_databricks_payload(
-                result,
-                databricks_export_mode,
-            )
-            target_path = push_target_path if db_tree else _resolve_databricks_target_path(
-                push_target_path,
-                result["source_name"],
-                extension,
-            )
+            if batch_results:
+                export_content, export_format, language, extension = _build_databricks_batch_payload(
+                    batch_results,
+                    databricks_export_mode,
+                )
+            else:
+                export_content, export_format, language, extension = _build_databricks_payload(
+                    active_result,
+                    databricks_export_mode,
+                )
+            target_path = push_target_path
             _push_to_databricks(
                 databricks_workspace_url,
                 databricks_token,
@@ -767,7 +1034,7 @@ if result:
                 export_content,
                 export_format,
                 language,
-                databricks_overwrite,
+                True,
             )
             st.success(f"Pushed to Databricks at {target_path}")
         except Exception as exc:
@@ -775,20 +1042,20 @@ if result:
 
     preview_left, preview_right = st.tabs(["XML Preview", "PySpark Preview"])
     with preview_left:
-        st.text_area("XML Preview", value=result["xml_preview"], height=420)
+        st.text_area("XML Preview", value=active_result["xml_preview"], height=420)
         st.download_button(
             "Download XML",
-            data=result["xml_preview"],
-            file_name=_download_name(result["source_name"], "xml"),
+            data=active_result["xml_preview"],
+            file_name=_download_name(active_result["source_name"], "xml"),
             mime="application/xml",
             use_container_width=True,
         )
     with preview_right:
-        st.text_area("PySpark Preview", value=result["pyspark_preview"], height=420)
+        st.text_area("PySpark Preview", value=active_result["pyspark_preview"], height=420)
         st.download_button(
             "Download PySpark",
-            data=result["pyspark_preview"],
-            file_name=_download_name(result["source_name"], "py"),
+            data=active_result["pyspark_preview"],
+            file_name=_download_name(active_result["source_name"], "py"),
             mime="text/x-python",
             use_container_width=True,
         )
