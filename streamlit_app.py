@@ -6,6 +6,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
@@ -55,7 +56,10 @@ def _normalize_github_raw_url(url: str) -> str:
 
 
 def _github_headers(token: str | None) -> dict[str, str]:
-    headers = {"Accept": "application/vnd.github+json"}
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "talend-item-converter/1.0",
+    }
     if token and token.strip():
         headers["Authorization"] = f"Bearer {token.strip()}"
     return headers
@@ -136,10 +140,28 @@ def _apply_vault_values(values: dict[str, str]) -> None:
 
 
 def _parse_github_profile_url(url: str) -> str | None:
-    cleaned = url.strip().rstrip("/")
-    match = re.match(r"^https?://github\.com/([^/]+)$", cleaned)
-    if match:
-        return match.group(1)
+    cleaned = url.strip()
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    if parsed.netloc.lower() != "github.com":
+        return None
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+
+    if parts[0].lower() == "orgs" and len(parts) >= 2:
+        return parts[1]
+
+    if len(parts) >= 1 and parts[0].lower() not in {"settings", "topics", "features", "contact", "pricing"}:
+        # Accept normal profile URLs such as:
+        # https://github.com/<user>
+        # https://github.com/<user>/
+        # https://github.com/<user>?tab=repositories
+        # https://github.com/<org>
+        return parts[0]
+
     return None
 
 
@@ -198,16 +220,23 @@ def _fetch_github_item(url: str, github_token: str | None = None) -> tuple[str, 
 
 @st.cache_data(show_spinner=False, ttl=600)
 def _fetch_github_repositories(username: str, token: str | None = None) -> list[str]:
+    headers = _github_headers(token)
     response = requests.get(
         f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated&type=owner",
-        headers=_github_headers(token),
+        headers=headers,
         timeout=60,
     )
     if response.status_code == 404:
         response = requests.get(
             f"https://api.github.com/orgs/{username}/repos?per_page=100&sort=updated&type=owner",
-            headers=_github_headers(token),
+            headers=headers,
             timeout=60,
+        )
+    if response.status_code in {401, 403}:
+        message = response.json().get("message", response.text.strip())
+        raise RuntimeError(
+            f"GitHub rejected the repository request for '{username}'. "
+            f"{message or 'Add a GitHub token for private repos or if you hit rate limits.'}"
         )
     response.raise_for_status()
     return [item["name"] for item in response.json()]
@@ -220,6 +249,12 @@ def _fetch_github_branches(owner: str, repo: str, token: str | None = None) -> l
         headers=_github_headers(token),
         timeout=60,
     )
+    if response.status_code in {401, 403}:
+        message = response.json().get("message", response.text.strip())
+        raise RuntimeError(
+            f"GitHub rejected the branch request for '{owner}/{repo}'. "
+            f"{message or 'Add a GitHub token if the repo is private or you are rate-limited.'}"
+        )
     response.raise_for_status()
     return [item["name"] for item in response.json()]
 
@@ -231,6 +266,12 @@ def _fetch_github_item_paths(owner: str, repo: str, branch: str, token: str | No
         headers=_github_headers(token),
         timeout=60,
     )
+    if response.status_code in {401, 403}:
+        message = response.json().get("message", response.text.strip())
+        raise RuntimeError(
+            f"GitHub rejected the job scan for '{owner}/{repo}@{branch}'. "
+            f"{message or 'Add a GitHub token if the repo is private or you are rate-limited.'}"
+        )
     response.raise_for_status()
     payload = response.json()
     return [
