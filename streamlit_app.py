@@ -165,6 +165,19 @@ def _parse_github_profile_url(url: str) -> str | None:
     return None
 
 
+def _split_github_repo_reference(repo_ref: str, default_owner: str | None = None) -> tuple[str, str]:
+    cleaned = repo_ref.strip()
+    if "/" in cleaned:
+        owner, repo = cleaned.split("/", 1)
+        owner = owner.strip()
+        repo = repo.strip()
+        if owner and repo:
+            return owner, repo
+    if default_owner:
+        return default_owner, cleaned
+    return cleaned, cleaned
+
+
 def _parse_github_blob_url(url: str) -> tuple[str, str, str, str]:
     cleaned = url.strip()
     blob_match = re.match(
@@ -221,6 +234,29 @@ def _fetch_github_item(url: str, github_token: str | None = None) -> tuple[str, 
 @st.cache_data(show_spinner=False, ttl=600)
 def _fetch_github_repositories(username: str, token: str | None = None) -> list[str]:
     headers = _github_headers(token)
+    if token and token.strip():
+        response = requests.get(
+            "https://api.github.com/user/repos?per_page=100&sort=updated&visibility=all&affiliation=owner,collaborator,organization_member",
+            headers=headers,
+            timeout=60,
+        )
+        if response.status_code in {401, 403}:
+            message = response.json().get("message", response.text.strip())
+            raise RuntimeError(
+                "GitHub rejected the authenticated repository request. "
+                f"{message or 'Check the fine-grained token permissions for Repository contents: read and Metadata: read.'}"
+            )
+        response.raise_for_status()
+        repos = response.json()
+        repo_names = [item.get("full_name") or f"{item.get('owner', {}).get('login', username)}/{item['name']}" for item in repos]
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for repo_name in repo_names:
+            if repo_name and repo_name not in seen:
+                seen.add(repo_name)
+                deduped.append(repo_name)
+        return deduped
+
     response = requests.get(
         f"https://api.github.com/users/{username}/repos?per_page=100&sort=updated&type=owner",
         headers=headers,
@@ -239,7 +275,10 @@ def _fetch_github_repositories(username: str, token: str | None = None) -> list[
             f"{message or 'Add a GitHub token for private repos or if you hit rate limits.'}"
         )
     response.raise_for_status()
-    return [item["name"] for item in response.json()]
+    return [
+        item.get("full_name") or f"{item.get('owner', {}).get('login', username)}/{item['name']}"
+        for item in response.json()
+    ]
 
 
 @st.cache_data(show_spinner=False, ttl=600)
@@ -834,8 +873,9 @@ else:
 
         if repos:
             selected_repo = st.selectbox("Repository Name", repos, index=0)
+            repo_owner, repo_name = _split_github_repo_reference(selected_repo, github_username)
             try:
-                branches = _fetch_github_branches(github_username, selected_repo, github_token or None)
+                branches = _fetch_github_branches(repo_owner, repo_name, github_token or None)
             except Exception as exc:
                 st.error(f"Could not load branches for {selected_repo}: {exc}")
                 branches = []
@@ -843,7 +883,7 @@ else:
             if branches:
                 selected_branch = st.selectbox("Branch Name", branches, index=0)
                 try:
-                    jobs = _fetch_github_item_paths(github_username, selected_repo, selected_branch, github_token or None)
+                    jobs = _fetch_github_item_paths(repo_owner, repo_name, selected_branch, github_token or None)
                 except Exception as exc:
                     st.error(f"Could not load `.item` files for {selected_repo}@{selected_branch}: {exc}")
                     jobs = []
@@ -852,7 +892,7 @@ else:
                     st.markdown("**Select jobs to convert**")
                     action_left, action_right, action_spacer = st.columns([1, 1, 2])
                     job_keys = [
-                        _job_checkbox_key(github_username, selected_repo, selected_branch, idx)
+                        _job_checkbox_key(repo_owner, repo_name, selected_branch, idx)
                         for idx in range(len(jobs))
                     ]
                     with action_left:
@@ -890,12 +930,7 @@ else:
                         batch_results = []
                         branch_tree = []
                         try:
-                            branch_tree = _fetch_github_branch_tree(
-                                github_username,
-                                selected_repo,
-                                selected_branch,
-                                github_token or None,
-                            )
+                            branch_tree = _fetch_github_branch_tree(repo_owner, repo_name, selected_branch, github_token or None)
                         except Exception:
                             branch_tree = []
 
@@ -903,7 +938,7 @@ else:
                         for idx, selected_job in enumerate(selected_jobs, start=1):
                             try:
                                 github_source_name, github_source_text = _fetch_github_item(
-                                    f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
+                                    f"https://github.com/{repo_owner}/{repo_name}/blob/{selected_branch}/{selected_job}",
                                     github_token=github_token,
                                 )
                                 github_properties_name = None
@@ -912,7 +947,7 @@ else:
                                     matched_properties = _match_properties_path(selected_job, branch_tree)
                                     if matched_properties:
                                         github_properties_name, github_properties_text = _fetch_github_item(
-                                            f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{matched_properties}",
+                                            f"https://github.com/{repo_owner}/{repo_name}/blob/{selected_branch}/{matched_properties}",
                                             github_token=github_token,
                                         )
                                 except Exception:
@@ -934,7 +969,7 @@ else:
                                         "repo": selected_repo,
                                         "branch": selected_branch,
                                         "job": selected_job,
-                                        "source_url": f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
+                                        "source_url": f"https://github.com/{repo_owner}/{repo_name}/blob/{selected_branch}/{selected_job}",
                                         "preview_label": f"{selected_job}",
                                     }
                                 )
@@ -951,7 +986,7 @@ else:
                                         "repo": selected_repo,
                                         "branch": selected_branch,
                                         "job": selected_job,
-                                        "source_url": f"https://github.com/{github_username}/{selected_repo}/blob/{selected_branch}/{selected_job}",
+                                        "source_url": f"https://github.com/{repo_owner}/{repo_name}/blob/{selected_branch}/{selected_job}",
                                         "preview_label": f"{selected_job}",
                                     }
                                 )
